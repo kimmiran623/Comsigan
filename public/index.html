@@ -5,9 +5,22 @@ const $=id=>document.getElementById(id);const DAYS=['월','화','수','목','금
 function kst(){const parts=new Intl.DateTimeFormat('en-US',{timeZone:'Asia/Seoul',year:'numeric',month:'2-digit',day:'2-digit',weekday:'short'}).formatToParts(new Date());const get=t=>parts.find(x=>x.type===t)?.value;const year=+get('year'),month=+get('month'),date=+get('day'),index=WEEK[get('weekday')];return {key:`${year}-${pad(month)}-${pad(date)}`,label:`${year}. ${pad(month)}. ${pad(date)}. (${DAYS[index]})`,day:index>=5?0:index,weekend:index>=5};}
 let current=kst(),data=null,loading=false;
 // 학교의 모든 학년/요일에 등장하는 과목을 통합해 가나다순으로 색상을 배정합니다.
+// 부드러운 파스텔 배경과 같은 계열의 진한 글씨색을 한 쌍으로 사용합니다.
 const SUBJECT_PALETTE=[
-  '#F29C9F','#7CA5D8','#F6AC78','#8BC49B','#BA9777','#AFA089','#C2AC95',
-  '#9396D8','#79CCB8','#5BC8D4','#B2D468','#BFA2DB','#F3CE6D','#E085A4'
+  ['#FCE4E8','#85485A'], // 로즈
+  ['#E5EDFF','#425E96'], // 페리윙클
+  ['#FFF0DE','#96653D'], // 피치
+  ['#E5F4E9','#42755A'], // 세이지
+  ['#F1E7FC','#735393'], // 라벤더
+  ['#FFF3CE','#8A7032'], // 버터
+  ['#DFF4F2','#397D7B'], // 민트
+  ['#F9E4F1','#8D5279'], // 블러시
+  ['#E8F1FC','#476C93'], // 스카이
+  ['#F2EADC','#80684C'], // 오트
+  ['#EAF3DD','#647A3D'], // 피스타치오
+  ['#FBE9E0','#98634D'], // 코랄
+  ['#E9E8FA','#615F96'], // 라일락
+  ['#E3F2F9','#45768D']  // 아이스블루
 ];
 let subjectColorMap=new Map();
 function subjectGroup(name){
@@ -33,7 +46,7 @@ function rebuildSubjectColors(grades){
   subjectColorMap=new Map(sorted.map((name,i)=>[name,SUBJECT_PALETTE[i%SUBJECT_PALETTE.length]]));
 }
 function subjectColors(name){
-  return [subjectColorMap.get(subjectGroup(name))||'#EDF1F5','#172033'];
+  return subjectColorMap.get(subjectGroup(name))||['#F1F4F8','#596579'];
 }
 function el(tag,text,cls){const x=document.createElement(tag);if(text!==undefined)x.textContent=text;if(cls)x.className=cls;return x}
 function render(){const day=current.day;$('today').textContent=`대한민국 ${current.label}${current.weekend?' · 다음 월요일 시간표 표시':''}`;if(!data)return;const groups=[1,2,3].map(grade=>({grade,classes:Object.keys(data.grades?.[grade]||{}).map(Number).filter(Number.isInteger).sort((a,b)=>a-b)}));$('counts').textContent=groups.map(g=>`${g.grade}학년 ${g.classes.length}개 반`).join(' · ');const totalClasses=groups.reduce((sum,g)=>sum+g.classes.length,0);document.querySelector('.schedule').style.setProperty('--columns',Math.max(1,totalClasses));const head=$('head');head.replaceChildren();const top=el('tr');top.append(el('th','교시','period'));for(const group of groups){if(!group.classes.length)continue;const th=el('th',`${group.grade}학년`);th.colSpan=group.classes.length;top.append(th)}head.append(top);const row=el('tr');row.append(el('th','','period'));for(const group of groups)group.classes.forEach((c,i)=>row.append(el('th',`${c}반`,i===0?'grade-start':'')));head.append(row);
