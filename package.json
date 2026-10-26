@@ -1,0 +1,7 @@
+{
+  "name": "comsigan-school-timetable",
+  "version": "2.0.0",
+  "private": true,
+  "scripts": {"start": "node server.js"},
+  "dependencies": {"comcigan-parser": "^1.0.0", "express": "^4.21.2"}
+}
