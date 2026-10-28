@@ -1,63 +1,265 @@
+
 const express = require('express');
-const Timetable = require('comcigan-parser');
-const fs = require('fs');
 const path = require('path');
 const app = express();
+
 const TTL = 60 * 60 * 1000;
-let cache = null, cachedAt = 0, pending = null;
-function schoolName() {
-  const lines = fs.readFileSync(path.join(__dirname, 'school.txt'), 'utf8').replace(/^\uFEFF/, '').split(/\r?\n/);
-  const school = lines.map(s => s.trim()).find(s => s && !s.startsWith('#'));
-  if (!school) throw new Error('school.txt에 학교명을 입력하세요.');
-  return school;
+let cache = null;
+let cachedAt = 0;
+let pending = null;
+
+// Vercel 환경 변수에서 학교코드 읽기
+function schoolCode() {
+  const value = String(
+    process.env.COMCIGAN_SCHOOL_CODE || ''
+  ).trim();
+
+  if (!/^\d{1,10}$/.test(value)) {
+    throw new Error(
+      'COMCIGAN_SCHOOL_CODE 환경 변수에 숫자 학교코드를 설정하세요.'
+    );
+  }
+
+  return value;
 }
-function convert(raw) {
+
+// 비공식 교사용 시간표 데이터 조회
+async function requestTeacherData(code) {
+  const encoded = Buffer.from(
+    `73629_${code}_0_1`,
+    'utf8'
+  ).toString('base64');
+
+  const url =
+    `http://comci.net:4082/36179?${encodeURIComponent(encoded)}`;
+
+  const response = await fetch(url, {
+    signal: AbortSignal.timeout(12000)
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `교사용 시간표 서버 응답 오류 (${response.status})`
+    );
+  }
+
+  const body = (await response.text())
+    .replace(/\u0000/g, '');
+
+  let json;
+
+  try {
+    json = JSON.parse(body);
+  } catch {
+    throw new Error(
+      '교사용 데이터 형식을 해석하지 못했습니다.'
+    );
+  }
+
+  if (
+    !json ||
+    !Array.isArray(json['자료481']) ||
+    !Array.isArray(json['자료446']) ||
+    !Array.isArray(json['자료492'])
+  ) {
+    throw new Error(
+      '교사용 데이터 구조가 예상과 다릅니다. 실제 응답 구조 확인이 필요합니다.'
+    );
+  }
+
+  return json;
+}
+
+function at(root, ...indices) {
+  return indices.reduce(
+    (value, index) =>
+      Array.isArray(value) ? value[index] : undefined,
+    root
+  );
+}
+
+// 교사용 데이터를 기존 웹앱 형식으로 변환
+function convertTeacherData(raw) {
+  const teachers = raw['자료446'];
+  const subjects = raw['자료492'];
+  const classCounts = raw['학급수'];
+  const original = raw['자료481'];
+
   const grades = {};
-  for (let g = 1; g <= 3; g++) {
-    grades[g] = {};
-    const classes = raw?.[g] || raw?.[String(g)] || {};
-    for (const [key, days] of Object.entries(classes)) {
-      const n = Number(key);
-      if (!Number.isInteger(n) || n < 1 || !Array.isArray(days)) continue;
-      grades[g][n] = Array.from({length: 5}, (_, d) => {
-        const periods = Array.isArray(days[d]) ? days[d] : [];
-        return periods.filter(Boolean).map((p, i) => ({
-          period: Number(p.classTime) || i + 1,
-          subject: String(p.subject || ''),
-          teacher: String(p.teacher || ''),
-          modified: Boolean(p.isModify || p.changed)
-        }));
-      });
+  let count = 0;
+
+  for (let grade = 1; grade <= 3; grade++) {
+    grades[grade] = {};
+
+    const n = Number(at(classCounts, grade) || 0);
+
+    if (
+      !Number.isInteger(n) ||
+      n < 0 ||
+      n > 40
+    ) {
+      throw new Error(
+        '학급 수 데이터가 올바르지 않습니다.'
+      );
+    }
+
+    for (let cls = 1; cls <= n; cls++) {
+      grades[grade][cls] = Array.from(
+        { length: 5 },
+        (_, day) => {
+          const periods = at(
+            original,
+            grade,
+            cls,
+            day + 1
+          );
+
+          if (!Array.isArray(periods)) {
+            return [];
+          }
+
+          return periods
+            .slice(1)
+            .map((value, index) => {
+              const code = Number(value || 0);
+
+              if (
+                !Number.isInteger(code) ||
+                code <= 0
+              ) {
+                return null;
+              }
+
+              const extraTeacher =
+                code > 10000
+                  ? Math.floor(code / 100000)
+                  : 0;
+
+              const rest = extraTeacher
+                ? code - extraTeacher * 100000
+                : code;
+
+              const teacherId = Math.floor(
+                rest / 100
+              );
+
+              const subjectId =
+                rest - teacherId * 100;
+
+              const teacher = String(
+                teachers[teacherId] || ''
+              ).trim();
+
+              const subject = String(
+                subjects[subjectId] || ''
+              ).trim();
+
+              if (!subject && !teacher) {
+                return null;
+              }
+
+              return {
+                period: index + 1,
+                subject,
+                teacher,
+                modified: false
+              };
+            })
+            .filter(Boolean);
+        }
+      );
+
+      count++;
     }
   }
+
+  if (!count) {
+    throw new Error(
+      '학급 시간표가 비어 있습니다. 학교코드 또는 데이터 형식을 확인하세요.'
+    );
+  }
+
   return grades;
 }
+
+// 1시간 캐시
 async function fetchData(force) {
-  const school = schoolName();
-  if (!force && cache?.school === school && Date.now() - cachedAt < TTL) return cache;
-  if (pending) return pending;
+  const code = schoolCode();
+
+  if (
+    !force &&
+    cache &&
+    cache.code === code &&
+    Date.now() - cachedAt < TTL
+  ) {
+    return cache.data;
+  }
+
+  if (pending) {
+    return pending;
+  }
+
   pending = (async () => {
-    const client = new Timetable();
-    await client.init({maxGrade: 3});
-    const results = await client.search(school);
-    const exact = results.filter(s => s.name === school);
-    if (!exact.length) throw new Error(`컴시간에서 '${school}' 학교를 찾지 못했습니다.`);
-    if (exact.length > 1) throw new Error('같은 이름의 학교가 여러 곳 검색됩니다. 학교명만으로 구분할 수 없습니다.');
-    client.setSchool(exact[0].code);
-    const grades = convert(await client.getTimetable());
-    const counts = Object.fromEntries([1,2,3].map(g => [g, Object.keys(grades[g]).length]));
-    if (!Object.values(counts).some(Boolean)) throw new Error('학급 시간표가 비어 있거나 데이터 형식이 변경되었습니다.');
+    const raw = await requestTeacherData(code);
+    const grades = convertTeacherData(raw);
+
+    const counts = Object.fromEntries(
+      [1, 2, 3].map(g => [
+        g,
+        Object.keys(grades[g]).length
+      ])
+    );
+
+    const data = {
+      school: String(
+        process.env.SCHOOL_DISPLAY_NAME ||
+        '전 학년 시간표'
+      ),
+      grades,
+      counts,
+      fetchedAt: new Date().toISOString(),
+      refreshMinutes: 60
+    };
+
+    cache = { code, data };
     cachedAt = Date.now();
-    cache = {school, grades, counts, fetchedAt: new Date(cachedAt).toISOString(), refreshMinutes: 60};
-    return cache;
+
+    return data;
   })();
-  try { return await pending; } finally { pending = null; }
+
+  try {
+    return await pending;
+  } finally {
+    pending = null;
+  }
 }
+
+// 기존 index.html과 동일한 API 주소
 app.get('/api/timetable', async (req, res) => {
   res.set('Cache-Control', 'no-store');
-  try { res.json(await fetchData(req.query.refresh === '1')); }
-  catch (e) { res.status(502).json({error: e.message || '시간표 조회 오류'}); }
+
+  try {
+    res.json(
+      await fetchData(req.query.refresh === '1')
+    );
+  } catch (error) {
+    res.status(502).json({
+      error:
+        error.message ||
+        '교사용 시간표 조회 실패'
+    });
+  }
 });
-app.use(express.static(path.join(__dirname, 'public')));
-if (require.main === module) app.listen(process.env.PORT || 3000);
+
+// 기존 화면 유지
+app.use(
+  express.static(
+    path.join(__dirname, 'public')
+  )
+);
+
+if (require.main === module) {
+  app.listen(process.env.PORT || 3000);
+}
+
 module.exports = app;
