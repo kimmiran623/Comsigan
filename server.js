@@ -2,24 +2,36 @@
 'use strict';
 
 const express = require('express');
-const Timetable = require('comcigan-parser');
 const fs = require('fs');
 const path = require('path');
 
 const app = express();
 
 const TTL = 60 * 60 * 1000;
+const MAX_GRADE = 3;
+const MAX_PROBE_CLASS = 15;
 
 let cache = null;
 let cachedAt = 0;
 let pending = null;
 
+// ES 모듈 라이브러리 불러오기
+let ComciganPromise = null;
+
+async function getComcigan() {
+  if (!ComciganPromise) {
+    ComciganPromise = import('parse-comcigan')
+      .then(module => module.default);
+  }
+
+  return ComciganPromise;
+}
+
 // school.txt에서 학교명 읽기
 function schoolName() {
-  const filePath = path.join(__dirname, 'school.txt');
+  const file = path.join(__dirname, 'school.txt');
 
-  const lines = fs
-    .readFileSync(filePath, 'utf8')
+  const lines = fs.readFileSync(file, 'utf8')
     .replace(/^\uFEFF/, '')
     .split(/\r?\n/);
 
@@ -34,81 +46,165 @@ function schoolName() {
   return school;
 }
 
-// 컴시간 데이터를 기존 화면 형식으로 변환
-function convert(raw) {
-  const grades = {};
+// 수업 데이터 변환
+function convertLesson(p, index) {
+  if (!p) return null;
 
-  for (let g = 1; g <= 3; g++) {
-    grades[g] = {};
+  if (typeof p === 'string') {
+    return {
+      period: index + 1,
+      subject: p,
+      teacher: '',
+      modified: false
+    };
+  }
 
-    const classes =
-      raw?.[g] ||
-      raw?.[String(g)] ||
-      {};
+  if (typeof p !== 'object') return null;
 
-    for (const [key, days] of Object.entries(classes)) {
-      const n = Number(key);
+  return {
+    period: Number(
+      p.classTime ?? p.period ?? p.periodNum
+    ) || index + 1,
+
+    subject: String(
+      p.subject ?? p.subjectName ?? p.name ?? ''
+    ),
+
+    teacher: String(
+      p.teacher ?? p.teacherName ?? ''
+    ),
+
+    modified: Boolean(
+      p.isModify ??
+      p.changed ??
+      p.modified ??
+      false
+    )
+  };
+}
+
+// 학급 시간표를 월~금 배열로 변환
+function convertDays(raw) {
+  const source =
+    raw?.timetable ??
+    raw?.schedule ??
+    raw?.data ??
+    raw;
+
+  const days = Array.from({ length: 5 }, () => []);
+
+  if (!source || typeof source !== 'object') {
+    return days;
+  }
+
+  // 배열: [월요일, 화요일, ...]
+  if (Array.isArray(source)) {
+    for (let d = 0; d < 5; d++) {
+      const periods = source[d];
+
+      if (!Array.isArray(periods)) continue;
+
+      days[d] = periods
+        .map(convertLesson)
+        .filter(Boolean);
+    }
+
+    return days;
+  }
+
+  // 객체: 요일 이름 또는 숫자 키
+  const dayNames = [
+    ['월', '월요일', 'monday', 'Monday'],
+    ['화', '화요일', 'tuesday', 'Tuesday'],
+    ['수', '수요일', 'wednesday', 'Wednesday'],
+    ['목', '목요일', 'thursday', 'Thursday'],
+    ['금', '금요일', 'friday', 'Friday']
+  ];
+
+  const keys = Object.keys(source);
+  const numeric = keys.filter(k => /^\d+$/.test(k));
+
+  const zeroBased = numeric.includes('0');
+
+  for (let d = 0; d < 5; d++) {
+    const candidates = [
+      ...dayNames[d],
+      String(zeroBased ? d : d + 1)
+    ];
+
+    const key = candidates.find(
+      candidate => Object.prototype.hasOwnProperty.call(
+        source,
+        candidate
+      )
+    );
+
+    if (key === undefined) continue;
+
+    const periods = source[key];
+
+    if (!Array.isArray(periods)) continue;
+
+    days[d] = periods
+      .map(convertLesson)
+      .filter(Boolean);
+  }
+
+  return days;
+}
+
+// 학급별 시간표에 실제 수업이 있는지 확인
+function hasLessons(days) {
+  return days.some(day => day.length > 0);
+}
+
+// 학교 정보에서 학년별 학급 수 추출
+function getClassCounts(info) {
+  const result = {};
+
+  const candidates = [
+    info?.classCounts,
+    info?.classCount,
+    info?.classes,
+    info?.학급수,
+    info?.data?.classCounts,
+    info?.data?.classCount,
+    info?.data?.학급수
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== 'object') {
+      continue;
+    }
+
+    for (let g = 1; g <= MAX_GRADE; g++) {
+      const value = Array.isArray(candidate)
+        ? candidate[g]
+        : candidate[g] ?? candidate[String(g)];
+
+      const count = Number(value);
 
       if (
-        !Number.isInteger(n) ||
-        n < 1 ||
-        !Array.isArray(days)
+        Number.isInteger(count) &&
+        count > 0 &&
+        count <= 40
       ) {
-        continue;
+        result[g] = count;
       }
+    }
 
-      grades[g][n] = Array.from(
-        { length: 5 },
-        (_, d) => {
-          const periods = Array.isArray(days[d])
-            ? days[d]
-            : [];
-
-          return periods
-            .filter(Boolean)
-            .map((p, i) => ({
-              period: Number(p.classTime) || i + 1,
-              subject: String(p.subject || ''),
-              teacher: String(p.teacher || ''),
-              modified: Boolean(
-                p.isModify || p.changed
-              )
-            }));
-        }
-      );
+    if (Object.keys(result).length === MAX_GRADE) {
+      break;
     }
   }
 
-  return grades;
+  return result;
 }
 
-// 단계별 오류 메시지 생성
-function stageError(stage, error) {
-  const message = error?.message || String(error);
-
-  console.error(`[컴시간 ${stage} 실패]`, error);
-
-  if (
-    stage === '초기화' &&
-    message.includes('식별 코드')
-  ) {
-    return new Error(
-      '컴시간학생 파서 초기화 실패: ' +
-      message +
-      ' (컴시간 사이트 변경 또는 파서 호환성 문제 가능성)'
-    );
-  }
-
-  return new Error(
-    `컴시간 ${stage} 실패: ${message}`
-  );
-}
-
-// 컴시간학생 데이터 조회
+// 학교의 시간표 전체 조회
 async function fetchData(force = false) {
   const school = schoolName();
 
-  // 기존 데이터가 유효하면 재사용
   if (
     !force &&
     cache?.school === school &&
@@ -117,47 +213,33 @@ async function fetchData(force = false) {
     return cache;
   }
 
-  // 중복 요청 방지
-  if (pending) {
-    return pending;
-  }
+  if (pending) return pending;
 
   pending = (async () => {
-    const client = new Timetable();
+    const Comcigan = await getComcigan();
 
-    // 1단계: 파서 초기화
-    try {
-      await client.init({
-        maxGrade: 3,
-        cache: 0
-      });
-    } catch (error) {
-      throw stageError('초기화', error);
-    }
-
-    // 2단계: 학교 검색
+    // 학교 검색
     let results;
 
     try {
-      results = await client.search(school);
+      results = await Comcigan.search(school);
     } catch (error) {
-      throw stageError('학교 검색', error);
-    }
-
-    if (!Array.isArray(results)) {
       throw new Error(
-        '학교 검색 결과가 올바르지 않습니다.'
+        '컴시간학생 학교 검색 실패: ' + error.message
       );
     }
 
-    // 정확히 일치하는 학교 선택
+    if (!Array.isArray(results)) {
+      throw new Error('학교 검색 결과가 올바르지 않습니다.');
+    }
+
     const exact = results.filter(
       item => item.name === school
     );
 
-    if (exact.length === 0) {
+    if (!exact.length) {
       throw new Error(
-        `컴시간에서 '${school}' 학교를 찾지 못했습니다.`
+        `'${school}' 학교를 찾지 못했습니다.`
       );
     }
 
@@ -167,29 +249,78 @@ async function fetchData(force = false) {
       );
     }
 
-    // 3단계: 학교 설정
+    const client = new Comcigan(exact[0].code);
+
+    // 학급 수 확인
+    let info = {};
+
     try {
-      await client.setSchool(exact[0].code);
+      info = await client.schoolInfo();
     } catch (error) {
-      throw stageError('학교 설정', error);
+      console.warn(
+        '학교 정보 조회 실패, 학급별 조회 시도:',
+        error.message
+      );
     }
 
-    // 4단계: 시간표 조회
-    let raw;
+    const classCounts = getClassCounts(info);
 
-    try {
-      raw = await client.getTimetable();
-    } catch (error) {
-      throw stageError('시간표 조회', error);
-    }
+    const grades = {
+      1: {},
+      2: {},
+      3: {}
+    };
 
-    // 5단계: 화면 데이터 변환
-    let grades;
+    // 학년별 학급 조회
+    for (let grade = 1; grade <= MAX_GRADE; grade++) {
+      const limit =
+        classCounts[grade] || MAX_PROBE_CLASS;
 
-    try {
-      grades = convert(raw);
-    } catch (error) {
-      throw stageError('데이터 변환', error);
+      const classNumbers = Array.from(
+        { length: limit },
+        (_, i) => i + 1
+      );
+
+      // 동시에 너무 많은 요청을 보내지 않도록 분할
+      for (let start = 0; start < classNumbers.length; start += 4) {
+        const batch = classNumbers.slice(start, start + 4);
+
+        const responses = await Promise.all(
+          batch.map(async classNum => {
+            try {
+              const raw = await client.timetable({
+                grade,
+                classNum
+              });
+
+              const days = convertDays(raw);
+
+              return {
+                classNum,
+                days,
+                valid: hasLessons(days)
+              };
+
+            } catch (error) {
+              console.warn(
+                `${grade}학년 ${classNum}반 조회 실패:`,
+                error.message
+              );
+
+              return {
+                classNum,
+                valid: false
+              };
+            }
+          })
+        );
+
+        for (const item of responses) {
+          if (item.valid) {
+            grades[grade][item.classNum] = item.days;
+          }
+        }
+      }
     }
 
     const counts = Object.fromEntries(
@@ -199,13 +330,16 @@ async function fetchData(force = false) {
       ])
     );
 
-    if (!Object.values(counts).some(Boolean)) {
+    const total = Object.values(counts)
+      .reduce((sum, n) => sum + n, 0);
+
+    if (total === 0) {
       throw new Error(
-        '학급 시간표가 비어 있거나 데이터 형식이 변경되었습니다.'
+        '시간표 데이터가 비어 있습니다. ' +
+        '새 라이브러리의 응답 형식을 확인해야 합니다.'
       );
     }
 
-    // 정상 조회 시 캐시 갱신
     cachedAt = Date.now();
 
     cache = {
@@ -216,10 +350,7 @@ async function fetchData(force = false) {
       refreshMinutes: 60
     };
 
-    console.log(
-      `[컴시간 조회 완료] ${school}`,
-      counts
-    );
+    console.log('시간표 조회 완료:', school, counts);
 
     return cache;
   })();
@@ -228,14 +359,12 @@ async function fetchData(force = false) {
     return await pending;
 
   } catch (error) {
-    console.error('[컴시간 조회 오류]', error);
+    console.error('시간표 조회 오류:', error);
 
-    // 최신 조회 실패 시 이전 정상 데이터 유지
     if (cache?.school === school) {
       return {
         ...cache,
-        warning:
-          '최신 시간표 조회 실패: ' + error.message
+        warning: error.message
       };
     }
 
@@ -246,29 +375,27 @@ async function fetchData(force = false) {
   }
 }
 
-// 시간표 API
+// API
 app.get('/api/timetable', async (req, res) => {
   res.set('Cache-Control', 'no-store');
 
   try {
-    const force = req.query.refresh === '1';
-
-    const data = await fetchData(force);
+    const data = await fetchData(
+      req.query.refresh === '1'
+    );
 
     res.json(data);
 
   } catch (error) {
     res.status(502).json({
-      error: error.message || '시간표 조회 오류'
+      error: error.message || '시간표 조회 실패'
     });
   }
 });
 
-// 기존 웹사이트 화면 유지
+// 기존 웹사이트 화면
 app.use(
-  express.static(
-    path.join(__dirname, 'public')
-  )
+  express.static(path.join(__dirname, 'public'))
 );
 
 // 서버 실행
@@ -276,9 +403,7 @@ if (require.main === module) {
   const PORT = Number(process.env.PORT) || 3000;
 
   app.listen(PORT, () => {
-    console.log(
-      `컴시간학생 시간표 서버 실행: ${PORT}`
-    );
+    console.log(`시간표 서버 실행: ${PORT}`);
   });
 }
 
